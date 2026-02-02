@@ -1,0 +1,328 @@
+from flask import Flask, render_template_string, request, redirect, url_for, flash, send_file
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from io import BytesIO
+import datetime
+
+app = Flask(__name__)
+app.secret_key = 'your_secret_key'  # Change this to a random secret
+
+# Login setup
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+
+class User(UserMixin):
+    def __init__(self, id, username):
+        self.id = id
+        self.username = username
+
+@login_manager.user_loader
+def load_user(user_id):
+    conn = sqlite3.connect('school.db')
+    c = conn.cursor()
+    c.execute("SELECT id, username FROM users WHERE id = ?", (user_id,))
+    user_data = c.fetchone()
+    conn.close()
+    if user_data:
+        return User(user_data[0], user_data[1])
+    return None
+
+# Initialize DB
+def init_db():
+    conn = sqlite3.connect('school.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE, password TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS students (id INTEGER PRIMARY KEY, name TEXT, class TEXT, contact TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS finances (id INTEGER PRIMARY KEY, type TEXT, category TEXT, amount REAL, date TEXT, description TEXT)''')
+    # Sample admin user (change password after first login)
+    try:
+        hashed = generate_password_hash('adminpass')
+        c.execute("INSERT INTO users (username, password) VALUES (?, ?)", ('admin', hashed))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass  # User exists
+    conn.close()
+
+init_db()
+
+# HTML Templates (Bootstrap for Microsoft Store-like look: clean cards, navbar)
+BASE_TEMPLATE = '''
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #f8f9fa; }
+        .navbar { background-color: #0078d4; } /* Microsoft blue */
+        .card { box-shadow: 0 4px 8px rgba(0,0,0,0.1); border: none; }
+        .grid-container { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 20px; }
+    </style>
+    <title>School Management System</title>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="/">School SMS</a>
+            <div class="collapse navbar-collapse">
+                <ul class="navbar-nav me-auto">
+                    {% if current_user.is_authenticated %}
+                    <li class="nav-item"><a class="nav-link" href="/students">Students</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/finances">Finances</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/report">Report</a></li>
+                    {% endif %}
+                </ul>
+                {% if current_user.is_authenticated %}
+                <span class="navbar-text me-2">Welcome, {{ current_user.username }}</span>
+                <a class="btn btn-outline-light" href="/logout">Logout</a>
+                {% else %}
+                <a class="btn btn-outline-light me-2" href="/login">Login</a>
+                <a class="btn btn-outline-light" href="/register">Register</a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+    <div class="container mt-4">
+        {% with messages = get_flashed_messages() %}
+        {% if messages %}
+        <div class="alert alert-info">{{ messages[0] }}</div>
+        {% endif %}
+        {% endwith %}
+        {{ content|safe }}
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+'''
+
+LOGIN_TEMPLATE = '''
+<form method="POST" class="card p-4 mx-auto" style="max-width: 400px;">
+    <h3 class="text-center">Login</h3>
+    <div class="mb-3"><input class="form-control" name="username" placeholder="Username" required></div>
+    <div class="mb-3"><input class="form-control" type="password" name="password" placeholder="Password" required></div>
+    <button class="btn btn-primary w-100" type="submit">Login</button>
+</form>
+'''
+
+REGISTER_TEMPLATE = '''
+<form method="POST" class="card p-4 mx-auto" style="max-width: 400px;">
+    <h3 class="text-center">Register</h3>
+    <div class="mb-3"><input class="form-control" name="username" placeholder="Username" required></div>
+    <div class="mb-3"><input class="form-control" type="password" name="password" placeholder="Password" required></div>
+    <button class="btn btn-primary w-100" type="submit">Register</button>
+</form>
+'''
+
+DASHBOARD_TEMPLATE = '''
+<div class="grid-container">
+    <div class="card p-3"><h5>Students</h5><p>Manage student records.</p><a href="/students" class="btn btn-primary">Go</a></div>
+    <div class="card p-3"><h5>Finances</h5><p>Track incomes & expenses.</p><a href="/finances" class="btn btn-primary">Go</a></div>
+    <div class="card p-3"><h5>Reports</h5><p>Generate financial reports.</p><a href="/report" class="btn btn-primary">Go</a></div>
+</div>
+'''
+
+FORM_TEMPLATE = '''
+<h2>{{ title }}</h2>
+<form method="POST" class="mb-4">
+    {{ fields|safe }}
+    <button class="btn btn-primary" type="submit">Add</button>
+</form>
+<h3>Records</h3>
+{{ table|safe }}
+'''
+
+REPORT_TEMPLATE = '''
+<h2>Financial Report</h2>
+{{ report|safe }}
+<a href="/download_pdf" class="btn btn-primary me-2">Download PDF</a>
+<a href="/download_excel" class="btn btn-primary">Download Excel</a>
+'''
+
+# Helpers
+def data_to_html_table(df):
+    return df.to_html(classes='table table-striped', index=False)
+
+# Routes
+@app.route('/')
+def home():
+    if current_user.is_authenticated:
+        content = DASHBOARD_TEMPLATE
+    else:
+        content = '<h1>Welcome to School SMS</h1><p>Please login or register.</p>'
+    return render_template_string(BASE_TEMPLATE, content=content)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        conn = sqlite3.connect('school.db')
+        c = conn.cursor()
+        c.execute("SELECT id, password FROM users WHERE username = ?", (username,))
+        user_data = c.fetchone()
+        conn.close()
+        if user_data and check_password_hash(user_data[1], password):
+            user = User(user_data[0], username)
+            login_user(user)
+            flash('Logged in successfully!')
+            return redirect(url_for('home'))
+        flash('Invalid credentials.')
+    content = LOGIN_TEMPLATE
+    return render_template_string(BASE_TEMPLATE, content=content)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = generate_password_hash(request.form['password'])
+        conn = sqlite3.connect('school.db')
+        c = conn.cursor()
+        try:
+            c.execute("INSERT INTO users (username, password) VALUES (?, ?)", (username, password))
+            conn.commit()
+            flash('Registered successfully! Please login.')
+            return redirect(url_for('login'))
+        except sqlite3.IntegrityError:
+            flash('Username taken.')
+        conn.close()
+    content = REGISTER_TEMPLATE
+    return render_template_string(BASE_TEMPLATE, content=content)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash('Logged out.')
+    return redirect(url_for('home'))
+
+@app.route('/students', methods=['GET', 'POST'])
+@login_required
+def students():
+    conn = sqlite3.connect('school.db')
+    if request.method == 'POST':
+        name = request.form['name']
+        class_ = request.form['class']
+        contact = request.form['contact']
+        c = conn.cursor()
+        c.execute("INSERT INTO students (name, class, contact) VALUES (?, ?, ?)", (name, class_, contact))
+        conn.commit()
+        flash('Student added.')
+    df = pd.read_sql_query("SELECT * FROM students", conn)
+    conn.close()
+    fields = '''
+        <div class="mb-3"><input class="form-control" name="name" placeholder="Name" required></div>
+        <div class="mb-3"><input class="form-control" name="class" placeholder="Class" required></div>
+        <div class="mb-3"><input class="form-control" name="contact" placeholder="Contact"></div>
+    '''
+    content = render_template_string(FORM_TEMPLATE, title='Students', fields=fields, table=data_to_html_table(df))
+    return render_template_string(BASE_TEMPLATE, content=content)
+
+@app.route('/finances', methods=['GET', 'POST'])
+@login_required
+def finances():
+    conn = sqlite3.connect('school.db')
+    if request.method == 'POST':
+        type_ = request.form['type']
+        category = request.form['category']
+        amount = float(request.form['amount'])
+        date = request.form['date']
+        desc = request.form['description']
+        c = conn.cursor()
+        c.execute("INSERT INTO finances (type, category, amount, date, description) VALUES (?, ?, ?, ?, ?)", 
+                  (type_, category, amount, date, desc))
+        conn.commit()
+        flash('Financial entry added.')
+    df = pd.read_sql_query("SELECT * FROM finances", conn)
+    conn.close()
+    fields = '''
+        <div class="mb-3">
+            <select class="form-select" name="type" required>
+                <option value="">Type</option><option value="Income">Income</option><option value="Expense">Expense</option>
+            </select>
+        </div>
+        <div class="mb-3">
+            <select class="form-select" name="category" required>
+                <option value="">Category</option><option value="Fees">Fees</option><option value="Donations">Donations</option>
+                <option value="Salaries">Salaries</option><option value="Utilities">Utilities</option><option value="Supplies">Supplies</option>
+            </select>
+        </div>
+        <div class="mb-3"><input class="form-control" name="amount" type="number" placeholder="Amount" required></div>
+        <div class="mb-3"><input class="form-control" name="date" type="date" required></div>
+        <div class="mb-3"><input class="form-control" name="description" placeholder="Description"></div>
+    '''
+    content = render_template_string(FORM_TEMPLATE, title='Finances', fields=fields, table=data_to_html_table(df))
+    return render_template_string(BASE_TEMPLATE, content=content)
+
+@app.route('/report')
+@login_required
+def report():
+    year = request.args.get('year', datetime.datetime.now().year)
+    conn = sqlite3.connect('school.db')
+    df = pd.read_sql_query(f"SELECT * FROM finances WHERE date LIKE '{year}%'", conn)
+    conn.close()
+    if df.empty:
+        report = '<p>No data for this year.</p>'
+    else:
+        income = df[df['type'] == 'Income']['amount'].sum()
+        expense = df[df['type'] == 'Expense']['amount'].sum()
+        by_category = df.groupby(['type', 'category'])['amount'].sum().reset_index()
+        report = f'''
+            <p>Total Income: {income}</p>
+            <p>Total Expenses: {expense}</p>
+            <p>Net Balance: {income - expense}</p>
+            <h4>Breakdown by Category</h4>
+            {data_to_html_table(by_category)}
+        '''
+    content = render_template_string(REPORT_TEMPLATE, report=report)
+    return render_template_string(BASE_TEMPLATE, content=content)
+
+@app.route('/download_pdf')
+@login_required
+def download_pdf():
+    buffer = BytesIO()
+    p = canvas.Canvas(buffer, pagesize=letter)
+    p.drawString(100, 750, "School Financial Report")
+    p.drawString(100, 730, f"Generated: {datetime.date.today()}")
+    # Add more dynamic content (e.g., from DB) here for professionalism
+    p.drawString(100, 700, "Total Income: [Calculate here]")
+    p.save()
+    buffer.seek(0)
+    return send_file(buffer, download_name='report.pdf', as_attachment=True)
+
+@app.route('/download_excel')
+@login_required
+def download_excel():
+    conn = sqlite3.connect('school.db')
+    df = pd.read_sql_query("SELECT * FROM finances", conn)
+    conn.close()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Finances"
+    border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+    fill_header = PatternFill(start_color="0078D4", end_color="0078D4", fill_type="solid")
+    for r_idx, row in enumerate(pd.DataFrame(df).itertuples(index=False), 1):
+        for c_idx, value in enumerate(row, 1):
+            cell = ws.cell(row=r_idx, column=c_idx, value=value)
+            cell.border = border
+            if r_idx == 1:
+                cell.fill = fill_header
+                cell.font = Font(color="FFFFFF", bold=True)
+    # Add summary sheet
+    ws_summary = wb.create_sheet("Summary")
+    ws_summary['A1'] = "Total Income"
+    ws_summary['B1'] = df[df['type'] == 'Income']['amount'].sum()
+    # Format similarly
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return send_file(output, download_name='report.xlsx', as_attachment=True)
+
+if __name__ == '__main__':
+    app.run(debug=True)
